@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# afk-plan — Process 1: Artifact creation (Intake → PRD → EDD → Red Team → Finalize)
+#
+# Usage:
+#   afk-plan [--feature NAME] [--project-dir PATH] [--repo-url URL]
+#                [--branch NAME] [--stack fullstack|backend|frontend]
+#                [--docker-profile NAME] [--non-interactive] [--dry-run]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+source "$REPO_ROOT/lib/common.sh"
+source "$REPO_ROOT/lib/manifest.sh"
+
+# ─── Parse CLI flags ─────────────────────────────────────────────────────────
+FEATURE_NAME=""
+PROJECT_DIR=""
+REPO_URL=""
+BRANCH=""
+STACK=""
+DOCKER_PROFILE=""
+NON_INTERACTIVE=0
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --feature)        FEATURE_NAME="$2"; shift 2 ;;
+    --project-dir)    PROJECT_DIR="$2"; shift 2 ;;
+    --repo-url)       REPO_URL="$2"; shift 2 ;;
+    --branch)         BRANCH="$2"; shift 2 ;;
+    --stack)          STACK="$2"; shift 2 ;;
+    --docker-profile) DOCKER_PROFILE="$2"; shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=1; shift ;;
+    --dry-run)        DRY_RUN=1; shift ;;
+    --help|-h)
+      echo "Usage: afk-plan [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --feature NAME          Feature name"
+      echo "  --project-dir PATH      Target project directory"
+      echo "  --repo-url URL          Git repository URL"
+      echo "  --branch NAME           Feature branch name"
+      echo "  --stack TYPE            fullstack | backend | frontend"
+      echo "  --docker-profile NAME   Docker compose profile name"
+      echo "  --non-interactive       Skip all prompts (requires flags)"
+      echo "  --dry-run               Show what would happen without executing"
+      echo "  --help                  Show this help"
+      exit 0
+      ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+export NON_INTERACTIVE DRY_RUN
+
+# ─── Banner ───────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}afk-plan${NC} — Artifact Creation Process"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# ─── Step 1: Gather inputs ───────────────────────────────────────────────────
+log_step "Step 1: Gather inputs"
+
+FEATURE_NAME=$(ask "Feature name" "" "$FEATURE_NAME")
+if [[ -z "$FEATURE_NAME" ]]; then
+  die "Feature name is required"
+fi
+
+FEATURE_SLUG=$(slugify "$FEATURE_NAME")
+log_dim "Slug: $FEATURE_SLUG"
+
+PROJECT_DIR=$(ask "Project directory" "$HOME/projects/$FEATURE_SLUG" "$PROJECT_DIR")
+PROJECT_DIR="${PROJECT_DIR/#\~/$HOME}"
+
+if [[ "${NON_INTERACTIVE:-0}" != "1" && -z "$REPO_URL" ]]; then
+  REPO_URL=$(ask "Git repo URL (blank for local)" "" "")
+else
+  REPO_URL="${REPO_URL:-}"
+fi
+
+# Determine stack
+if [[ -z "$STACK" ]]; then
+  STACK=$(ask "Stack type (fullstack/backend/frontend)" "fullstack" "$STACK")
+fi
+
+case "$STACK" in
+  fullstack)
+    HAS_BACKEND="true"
+    HAS_FRONTEND="true"
+    DOCKER_PROFILE="${DOCKER_PROFILE:-fastapi-react}"
+    ;;
+  backend)
+    HAS_BACKEND="true"
+    HAS_FRONTEND="false"
+    DOCKER_PROFILE="${DOCKER_PROFILE:-fastapi-only}"
+    ;;
+  frontend)
+    HAS_BACKEND="false"
+    HAS_FRONTEND="true"
+    DOCKER_PROFILE="${DOCKER_PROFILE:-react-only}"
+    ;;
+  *)
+    die "Invalid stack type: $STACK (expected fullstack, backend, or frontend)"
+    ;;
+esac
+
+if [[ -z "$BRANCH" ]]; then
+  BRANCH="feature/$FEATURE_SLUG"
+fi
+
+log_success "Inputs gathered"
+
+# ─── Step 2: Create session directory ─────────────────────────────────────────
+log_step "Step 2: Create session directory"
+
+SESSION_DIR="${AFK_HOME}/prd-sessions/$(today)-${FEATURE_SLUG}"
+mkdir -p "$SESSION_DIR"  # Always create — needed for artifact writes
+log_success "Session dir: $SESSION_DIR"
+
+# ─── Step 3: Write session state ─────────────────────────────────────────────
+log_step "Step 3: Write session state"
+
+SESSION_STATE="$SESSION_DIR/session-state.json"
+python3 -c "
+import json
+state = {
+    'feature_name': '$FEATURE_NAME',
+    'feature_slug': '$FEATURE_SLUG',
+    'project_dir': '$PROJECT_DIR',
+    'repo_url': '$REPO_URL',
+    'branch': '$BRANCH',
+    'stack': '$STACK',
+    'docker_profile': '$DOCKER_PROFILE',
+    'status': 'intake',
+    'created_at': '$(now_iso)'
+}
+with open('$SESSION_STATE', 'w') as f:
+    json.dump(state, f, indent=2)
+"
+log_success "Session state saved"
+
+# ─── Step 4: Check project directory ─────────────────────────────────────────
+log_step "Step 4: Check project directory"
+
+if [[ -d "$PROJECT_DIR" ]]; then
+  log_info "Project directory exists: $PROJECT_DIR"
+  if [[ -f "$PROJECT_DIR/CLAUDE.md" ]]; then
+    log_success "CLAUDE.md found"
+  else
+    log_warn "No CLAUDE.md found in project directory"
+  fi
+else
+  log_info "Project directory does not exist yet (will be created during build)"
+fi
+
+# ─── Step 5: Launch Claude Code with prd-assistant skill ─────────────────────
+log_step "Step 5: Launch planning session"
+
+# Copy skill files to session dir for reference
+SKILL_DIR="${AFK_HOME}/skills/prd-assistant"
+if [[ -d "$SKILL_DIR" ]]; then
+  log_info "PRD assistant skill available at $SKILL_DIR"
+else
+  log_warn "PRD assistant skill not found at $SKILL_DIR"
+  log_warn "Run setup.sh to install skills"
+fi
+
+# Build the planning prompt
+PLANNING_PROMPT="$SESSION_DIR/planning-prompt.md"
+cat > "$PLANNING_PROMPT" << PROMPT_EOF
+# Planning Session: $FEATURE_NAME
+
+You are running a PRD creation session for **$FEATURE_NAME**.
+
+## Session Info
+- **Session directory:** $SESSION_DIR
+- **Project directory:** $PROJECT_DIR
+- **Stack:** $STACK ($DOCKER_PROFILE)
+- **Branch:** $BRANCH
+
+## Your Task
+
+Follow the prd-assistant workflow to create these artifacts in $SESSION_DIR/:
+
+1. **00-INTAKE.md** — Structured intake from conversation
+2. **01-RESEARCH.md** — Web + internal doc research
+3. **02-PRD.md** — Product Requirements Document
+4. **03-EDD.md** — Engineering Design Document
+5. **04-CONFLICT-RESOLUTION.md** — Red team analysis
+6. **CLAUDE-MD-SPRINT-SECTION.md** — Sprint section for CLAUDE.md
+
+## Skill Reference
+
+$(cat "$SKILL_DIR/SKILL.md" 2>/dev/null || echo "PRD assistant skill not found. Follow standard PRD creation workflow.")
+
+## Templates
+
+Use the templates in $SKILL_DIR/templates/ as your starting structure:
+- 00-INTAKE-TEMPLATE.md
+- PRD-TEMPLATE.md
+- EDD-TEMPLATE.md
+- claude-md-sprint.md
+
+## Begin
+
+Start with the intake conversation. Ask the 6 intake questions one at a time.
+PROMPT_EOF
+
+log_success "Planning prompt generated: $PLANNING_PROMPT"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  log_dim "[dry-run] Would launch: claude < $PLANNING_PROMPT"
+  log_dim "[dry-run] Skipping Claude Code launch"
+else
+  if command -v claude &>/dev/null; then
+    echo ""
+    log_info "Launching Claude Code for interactive planning..."
+    log_dim "Session artifacts will be saved to: $SESSION_DIR/"
+    echo ""
+
+    claude < "$PLANNING_PROMPT"
+
+    log_success "Planning session complete"
+  else
+    log_warn "Claude Code CLI not found. Skipping interactive session."
+    log_info "Run manually: claude < $PLANNING_PROMPT"
+  fi
+fi
+
+# ─── Step 6: Validate outputs ────────────────────────────────────────────────
+log_step "Step 6: Validate outputs"
+
+REQUIRED_FILES=("00-INTAKE.md" "02-PRD.md" "03-EDD.md" "CLAUDE-MD-SPRINT-SECTION.md")
+MISSING=()
+
+for f in "${REQUIRED_FILES[@]}"; do
+  if [[ -f "$SESSION_DIR/$f" ]]; then
+    log_success "Found: $f"
+  else
+    log_warn "Missing: $f"
+    MISSING+=("$f")
+  fi
+done
+
+if [[ ${#MISSING[@]} -gt 0 && "$DRY_RUN" != "1" ]]; then
+  log_warn "${#MISSING[@]} required artifact(s) missing"
+  log_info "You can create them manually in: $SESSION_DIR/"
+  if ! confirm "Continue anyway and write manifest?"; then
+    log_info "Re-run afk-plan or create missing files, then re-run."
+    exit 1
+  fi
+fi
+
+# ─── Step 7: Write handoff manifest ──────────────────────────────────────────
+log_step "Step 7: Write handoff manifest"
+
+MANIFEST_PATH="$SESSION_DIR/handoff-manifest.json"
+manifest_write \
+  "$MANIFEST_PATH" \
+  "$FEATURE_NAME" \
+  "$FEATURE_SLUG" \
+  "$PROJECT_DIR" \
+  "$REPO_URL" \
+  "$BRANCH" \
+  "$HAS_BACKEND" \
+  "$HAS_FRONTEND" \
+  "$DOCKER_PROFILE" \
+  "$SESSION_DIR"
+
+# ─── Step 8: Print summary ───────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${BOLD}Planning Complete${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo -e "Feature:   ${BOLD}$FEATURE_NAME${NC}"
+echo -e "Session:   $SESSION_DIR"
+echo -e "Manifest:  $MANIFEST_PATH"
+echo ""
+echo "Artifacts:"
+for f in "${REQUIRED_FILES[@]}"; do
+  if [[ -f "$SESSION_DIR/$f" ]]; then
+    echo -e "  ${GREEN}+${NC} $f"
+  else
+    echo -e "  ${RED}-${NC} $f (missing)"
+  fi
+done
+echo ""
+echo -e "${BOLD}Next step:${NC}"
+echo ""
+echo "  afk-build --manifest $MANIFEST_PATH"
+echo ""

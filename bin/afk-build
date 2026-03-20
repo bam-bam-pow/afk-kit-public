@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# afk-build — Process 2: Build orchestration
+# (Git → Docker → Deps → Migrations → CLAUDE.md → Launch Claude)
+#
+# Usage:
+#   afk-build [--manifest PATH] [--session SLUG]
+#                 [--skip-docker] [--skip-git] [--skip-deps] [--skip-migrate]
+#                 [--dry-run] [--no-launch] [--non-interactive]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+source "$REPO_ROOT/lib/common.sh"
+source "$REPO_ROOT/lib/manifest.sh"
+source "$REPO_ROOT/lib/git-helpers.sh"
+source "$REPO_ROOT/lib/docker-helpers.sh"
+
+# ─── Parse CLI flags ─────────────────────────────────────────────────────────
+MANIFEST_PATH=""
+SESSION_SLUG=""
+SKIP_DOCKER=0
+SKIP_GIT=0
+SKIP_DEPS=0
+SKIP_MIGRATE=0
+DRY_RUN=0
+NO_LAUNCH=0
+NO_LOOP=0
+MAX_ITERATIONS=20
+NON_INTERACTIVE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --manifest)        MANIFEST_PATH="$2"; shift 2 ;;
+    --session)         SESSION_SLUG="$2"; shift 2 ;;
+    --skip-docker)     SKIP_DOCKER=1; shift ;;
+    --skip-git)        SKIP_GIT=1; shift ;;
+    --skip-deps)       SKIP_DEPS=1; shift ;;
+    --skip-migrate)    SKIP_MIGRATE=1; shift ;;
+    --dry-run)         DRY_RUN=1; shift ;;
+    --no-launch)       NO_LAUNCH=1; shift ;;
+    --no-loop)         NO_LOOP=1; shift ;;
+    --max-iterations)  MAX_ITERATIONS="$2"; shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=1; shift ;;
+    --help|-h)
+      echo "Usage: afk-build [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --manifest PATH      Path to handoff-manifest.json"
+      echo "  --session SLUG       Find manifest by session slug"
+      echo "  --skip-docker        Skip Docker setup"
+      echo "  --skip-git           Skip Git operations"
+      echo "  --skip-deps          Skip dependency installation"
+      echo "  --skip-migrate       Skip database migrations"
+      echo "  --dry-run            Show what would happen without executing"
+      echo "  --no-launch          Stop before launching Claude Code"
+      echo "  --no-loop            Single-shot mode (no Ralph Loop resilience)"
+      echo "  --max-iterations N   Max Ralph Loop iterations (default: 20)"
+      echo "  --non-interactive    Skip all prompts"
+      echo "  --help               Show this help"
+      exit 0
+      ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+export NON_INTERACTIVE DRY_RUN
+
+# ─── Banner ───────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}afk-build${NC} — Build Orchestration Process"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 1: Pre-flight validation
+# ═══════════════════════════════════════════════════════════════════════════════
+log_step "Phase 1: Pre-flight validation"
+
+# Locate manifest
+if [[ -n "$MANIFEST_PATH" ]]; then
+  log_info "Using manifest: $MANIFEST_PATH"
+elif [[ -n "$SESSION_SLUG" ]]; then
+  log_info "Looking up session: $SESSION_SLUG"
+  MANIFEST_PATH=$(manifest_find_by_session "$SESSION_SLUG")
+  log_info "Found manifest: $MANIFEST_PATH"
+else
+  log_info "No manifest specified, finding most recent..."
+  MANIFEST_PATH=$(manifest_find_latest)
+  log_info "Using latest manifest: $MANIFEST_PATH"
+fi
+
+# Validate manifest
+manifest_validate "$MANIFEST_PATH"
+
+# Read manifest values
+FEATURE_NAME=$(manifest_get "$MANIFEST_PATH" "feature.name")
+FEATURE_SLUG=$(manifest_get "$MANIFEST_PATH" "feature.slug")
+PROJECT_DIR=$(manifest_get "$MANIFEST_PATH" "project.directory")
+REPO_URL=$(manifest_get "$MANIFEST_PATH" "project.repo_url")
+BRANCH=$(manifest_get "$MANIFEST_PATH" "project.branch")
+HAS_BACKEND=$(manifest_get "$MANIFEST_PATH" "stack.has_backend")
+HAS_FRONTEND=$(manifest_get "$MANIFEST_PATH" "stack.has_frontend")
+DOCKER_PROFILE=$(manifest_get "$MANIFEST_PATH" "stack.docker_profile")
+SESSION_DIR=$(manifest_get "$MANIFEST_PATH" "artifacts.session_dir")
+
+log_info "Feature: $FEATURE_NAME ($FEATURE_SLUG)"
+log_info "Project: $PROJECT_DIR"
+log_info "Stack:   $DOCKER_PROFILE (backend=$HAS_BACKEND, frontend=$HAS_FRONTEND)"
+log_info "Branch:  $BRANCH"
+
+# Check for unresolved blockers
+manifest_check_blockers "$MANIFEST_PATH"
+
+# Verify required tools
+log_info "Checking required tools..."
+require_tool "git"
+if [[ "$SKIP_DOCKER" != "1" ]]; then
+  require_tool "docker" "Install Docker Desktop: https://docker.com"
+fi
+if [[ "$NO_LAUNCH" != "1" ]]; then
+  require_tool "claude" "Install Claude Code: npm install -g @anthropic-ai/claude-code"
+fi
+
+log_success "Phase 1 complete: pre-flight checks passed"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 2: Git setup
+# ═══════════════════════════════════════════════════════════════════════════════
+if [[ "$SKIP_GIT" != "1" ]]; then
+  log_step "Phase 2: Git setup"
+
+  git_clone_if_needed "$REPO_URL" "$PROJECT_DIR"
+
+  if [[ -d "$PROJECT_DIR/.git" ]]; then
+    git_pull_latest "$PROJECT_DIR"
+    git_feature_branch "$PROJECT_DIR" "$BRANCH"
+  fi
+
+  log_success "Phase 2 complete: Git ready"
+else
+  log_dim "Phase 2: Git setup (skipped)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 3: Docker environment
+# ═══════════════════════════════════════════════════════════════════════════════
+if [[ "$SKIP_DOCKER" != "1" ]]; then
+  log_step "Phase 3: Docker environment"
+
+  docker_ensure_compose "$PROJECT_DIR" "$DOCKER_PROFILE" "$REPO_ROOT"
+  docker_validate "$PROJECT_DIR"
+  docker_up "$PROJECT_DIR"
+  docker_check_services "$PROJECT_DIR" "$DOCKER_PROFILE"
+
+  log_success "Phase 3 complete: Docker services running"
+else
+  log_dim "Phase 3: Docker environment (skipped)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 4: Dependency installation
+# ═══════════════════════════════════════════════════════════════════════════════
+if [[ "$SKIP_DEPS" != "1" ]]; then
+  log_step "Phase 4: Dependency installation"
+
+  # Backend dependencies
+  if [[ "$HAS_BACKEND" == "True" || "$HAS_BACKEND" == "true" ]]; then
+    log_info "Detecting backend package manager..."
+
+    if [[ -f "$PROJECT_DIR/pyproject.toml" ]]; then
+      if command -v poetry &>/dev/null; then
+        log_info "Found pyproject.toml → poetry install"
+        run bash -c "cd '$PROJECT_DIR' && poetry install"
+      elif command -v uv &>/dev/null; then
+        log_info "Found pyproject.toml → uv sync"
+        run bash -c "cd '$PROJECT_DIR' && uv sync"
+      else
+        log_info "Found pyproject.toml → pip install"
+        run bash -c "cd '$PROJECT_DIR' && pip install -e '.[dev]'"
+      fi
+      log_success "Backend dependencies installed"
+    elif [[ -f "$PROJECT_DIR/requirements.txt" ]]; then
+      log_info "Found requirements.txt → pip install"
+      run bash -c "cd '$PROJECT_DIR' && pip install -r requirements.txt"
+      log_success "Backend dependencies installed"
+    else
+      log_dim "No backend dependency file found"
+    fi
+  fi
+
+  # Frontend dependencies
+  if [[ "$HAS_FRONTEND" == "True" || "$HAS_FRONTEND" == "true" ]]; then
+    log_info "Detecting frontend package manager..."
+
+    FRONTEND_DIR="$PROJECT_DIR"
+    [[ -d "$PROJECT_DIR/frontend" ]] && FRONTEND_DIR="$PROJECT_DIR/frontend"
+
+    if [[ -f "$FRONTEND_DIR/bun.lockb" ]]; then
+      log_info "Found bun.lockb → bun install"
+      run bash -c "cd '$FRONTEND_DIR' && bun install"
+    elif [[ -f "$FRONTEND_DIR/pnpm-lock.yaml" ]]; then
+      log_info "Found pnpm-lock.yaml → pnpm install"
+      run bash -c "cd '$FRONTEND_DIR' && pnpm install"
+    elif [[ -f "$FRONTEND_DIR/yarn.lock" ]]; then
+      log_info "Found yarn.lock → yarn install"
+      run bash -c "cd '$FRONTEND_DIR' && yarn install"
+    elif [[ -f "$FRONTEND_DIR/package-lock.json" ]]; then
+      log_info "Found package-lock.json → npm install"
+      run bash -c "cd '$FRONTEND_DIR' && npm install"
+    elif [[ -f "$FRONTEND_DIR/package.json" ]]; then
+      log_info "Found package.json → npm install"
+      run bash -c "cd '$FRONTEND_DIR' && npm install"
+    else
+      log_dim "No frontend dependency file found"
+    fi
+
+    log_success "Frontend dependencies installed"
+  fi
+
+  log_success "Phase 4 complete: Dependencies installed"
+else
+  log_dim "Phase 4: Dependency installation (skipped)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 5: Database migrations
+# ═══════════════════════════════════════════════════════════════════════════════
+if [[ "$SKIP_MIGRATE" != "1" && ("$HAS_BACKEND" == "True" || "$HAS_BACKEND" == "true") ]]; then
+  log_step "Phase 5: Database migrations"
+
+  if [[ -f "$PROJECT_DIR/alembic.ini" ]]; then
+    log_info "Found alembic.ini → running migrations"
+    run bash -c "cd '$PROJECT_DIR' && alembic upgrade head"
+    log_success "Alembic migrations applied"
+  elif [[ -f "$PROJECT_DIR/manage.py" ]]; then
+    log_info "Found manage.py → running Django migrations"
+    run bash -c "cd '$PROJECT_DIR' && python manage.py migrate"
+    log_success "Django migrations applied"
+  elif [[ -f "$PROJECT_DIR/backend/alembic.ini" ]]; then
+    log_info "Found backend/alembic.ini → running migrations"
+    run bash -c "cd '$PROJECT_DIR/backend' && alembic upgrade head"
+    log_success "Alembic migrations applied"
+  else
+    log_dim "No migration tool detected"
+  fi
+
+  log_success "Phase 5 complete: Migrations done"
+else
+  log_dim "Phase 5: Database migrations (skipped)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 6: CLAUDE.md setup
+# ═══════════════════════════════════════════════════════════════════════════════
+log_step "Phase 6: CLAUDE.md setup"
+
+CLAUDE_MD="$PROJECT_DIR/CLAUDE.md"
+
+# Create CLAUDE.md from template if it doesn't exist
+if [[ ! -f "$CLAUDE_MD" ]]; then
+  CLAUDE_TEMPLATE="$REPO_ROOT/templates/CLAUDE.md.template"
+  if [[ -f "$CLAUDE_TEMPLATE" ]]; then
+    log_info "Creating CLAUDE.md from template"
+    run cp "$CLAUDE_TEMPLATE" "$CLAUDE_MD"
+  else
+    log_warn "No CLAUDE.md template found"
+  fi
+fi
+
+# Append sprint section from planning artifacts
+SPRINT_SECTION="$SESSION_DIR/CLAUDE-MD-SPRINT-SECTION.md"
+if [[ -f "$SPRINT_SECTION" && -f "$CLAUDE_MD" ]]; then
+  log_info "Appending sprint section to CLAUDE.md"
+
+  # Remove existing sprint section if present
+  if grep -q "CURRENT SPRINT" "$CLAUDE_MD" 2>/dev/null; then
+    log_info "Replacing existing sprint section"
+    # Use python for reliable multi-line replacement
+    run python3 -c "
+import re
+with open('$CLAUDE_MD') as f:
+    content = f.read()
+# Remove everything from CURRENT SPRINT to end of file or next major section
+content = re.sub(r'# .* CURRENT SPRINT.*', '', content, flags=re.DOTALL)
+content = content.rstrip()
+with open('$CLAUDE_MD', 'w') as f:
+    f.write(content)
+"
+  fi
+
+  run bash -c "echo '' >> '$CLAUDE_MD' && echo '' >> '$CLAUDE_MD' && cat '$SPRINT_SECTION' >> '$CLAUDE_MD'"
+  log_success "Sprint section added to CLAUDE.md"
+else
+  log_dim "No sprint section to append"
+fi
+
+# Copy PRD + EDD into project directory
+PRD_FILE=$(manifest_get "$MANIFEST_PATH" "artifacts.prd")
+EDD_FILE=$(manifest_get "$MANIFEST_PATH" "artifacts.edd")
+CONFLICT_FILE=$(manifest_get "$MANIFEST_PATH" "artifacts.conflict_resolution")
+
+for src_file in "$PRD_FILE" "$EDD_FILE" "$CONFLICT_FILE"; do
+  if [[ -f "$src_file" ]]; then
+    local_name=$(basename "$src_file")
+    # Prefix with feature slug for clarity
+    dest_name="${FEATURE_SLUG}-${local_name}"
+    run cp "$src_file" "$PROJECT_DIR/$dest_name"
+    log_info "Copied $local_name → $dest_name"
+  fi
+done
+
+log_success "Phase 6 complete: CLAUDE.md configured"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 7: Session initialization
+# ═══════════════════════════════════════════════════════════════════════════════
+log_step "Phase 7: Session initialization"
+
+BUILD_DIR="${AFK_HOME}/builds/$(today)"
+run mkdir -p "$BUILD_DIR"
+
+# Generate overnight prompt from template
+OVERNIGHT_TEMPLATE="${AFK_HOME}/skills/build-orchestrator/overnight-prompt-template.md"
+OVERNIGHT_PROMPT="$BUILD_DIR/overnight-prompt.md"
+
+if [[ -f "$OVERNIGHT_TEMPLATE" ]]; then
+  log_info "Generating overnight prompt..."
+  SESSION_ID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
+
+  run bash -c "sed -e 's|{{DATE}}|$(today)|g' \
+      -e 's|{{PROJECT_NAME}}|$FEATURE_NAME|g' \
+      -e 's|{{PROJECT_DIR}}|$PROJECT_DIR|g' \
+      -e 's|{{SESSION_ID}}|$SESSION_ID|g' \
+      '$OVERNIGHT_TEMPLATE' > '$OVERNIGHT_PROMPT'"
+
+  # Inject quality patterns if available
+  PATTERNS_FILE="${AFK_HOME}/learning/QUALITY-PATTERNS.md"
+  if [[ -f "$PATTERNS_FILE" ]]; then
+    log_info "Injecting quality patterns..."
+    run python3 -c "
+with open('$PATTERNS_FILE') as f:
+    patterns = f.read()
+with open('$OVERNIGHT_PROMPT') as f:
+    prompt = f.read()
+prompt = prompt.replace('{{QUALITY_PATTERNS}}', patterns)
+with open('$OVERNIGHT_PROMPT', 'w') as f:
+    f.write(prompt)
+"
+  else
+    run python3 -c "
+with open('$OVERNIGHT_PROMPT') as f:
+    prompt = f.read()
+prompt = prompt.replace('{{QUALITY_PATTERNS}}', '(No patterns yet — this is the first build)')
+with open('$OVERNIGHT_PROMPT', 'w') as f:
+    f.write(prompt)
+"
+  fi
+
+  log_success "Overnight prompt generated: $OVERNIGHT_PROMPT"
+else
+  log_warn "Overnight prompt template not found at $OVERNIGHT_TEMPLATE"
+fi
+
+# Initialize tracking artifacts
+DATE=$(today)
+
+run bash -c "cat > '$BUILD_DIR/PROGRESS.md' << 'PROGRESS_EOF'
+# Overnight Session Progress
+
+**Project**: $FEATURE_NAME
+**Started**: $(now_iso)
+**Status**: Initialized (not started)
+
+## Completed
+(none yet)
+
+## In Progress
+(none yet)
+
+## Blocked
+(none yet)
+
+## Session Log
+| Time | Event | Details |
+|------|-------|---------|
+| $(timestamp) | Session initialized | Ready to start |
+PROGRESS_EOF"
+
+run bash -c "cat > '$BUILD_DIR/SKIPPED.md' << 'SKIPPED_EOF'
+# Skipped Items - $DATE
+
+> Items deferred during overnight build. Review and prioritize.
+
+## Skipped Tasks
+| Task | Reason | Priority |
+|------|--------|----------|
+
+## Deferred Decisions
+
+## Technical Debt Created
+| File | Issue | Risk |
+|------|-------|------|
+SKIPPED_EOF"
+
+run bash -c "cat > '$BUILD_DIR/TYPE-ERRORS.md' << 'ERRORS_EOF'
+# Type Errors Fixed - $DATE
+
+| Time | File | Error | Category | Fix |
+|------|------|-------|----------|-----|
+ERRORS_EOF"
+
+run touch "$BUILD_DIR/CORRECTIONS.jsonl"
+
+log_success "Phase 7 complete: Session artifacts initialized"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 8: Launch
+# ═══════════════════════════════════════════════════════════════════════════════
+if [[ "$NO_LAUNCH" != "1" ]]; then
+  log_step "Phase 8: Launch Claude Code"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log_dim "[dry-run] Would run: cd $PROJECT_DIR && claude --dangerously-skip-permissions < $OVERNIGHT_PROMPT"
+  else
+    if [[ ! -f "$OVERNIGHT_PROMPT" ]]; then
+      die "Overnight prompt not found: $OVERNIGHT_PROMPT"
+    fi
+
+    log_info "Branch: $(git_current_branch "$PROJECT_DIR")"
+    log_dim "Prompt: $OVERNIGHT_PROMPT"
+    echo ""
+
+    if [[ "$NO_LOOP" == "1" ]]; then
+      # ── Single-shot mode ──────────────────────────────────────────────
+      log_info "Launching Claude Code (single-shot, no loop)..."
+
+      (cd "$PROJECT_DIR" && claude --dangerously-skip-permissions < "$OVERNIGHT_PROMPT") &
+      CLAUDE_PID=$!
+      echo "$CLAUDE_PID" > "$BUILD_DIR/claude.pid"
+      log_success "Claude Code launched (PID: $CLAUDE_PID)"
+
+    else
+      # ── Ralph Loop mode (default) ────────────────────────────────────
+      # If Claude dies (context exhaustion, crash, timeout), the loop
+      # restarts it with the same prompt. Claude sees its previous work
+      # in PROGRESS.md + git history and picks up where it left off.
+      #
+      # The loop exits when:
+      #   1. MORNING-BRIEFING.md exists (build complete)
+      #   2. .pause-requested exists (user pause)
+      #   3. Max iterations reached (safety valve)
+      #   4. .abort-requested exists (user abort)
+      log_info "Launching Claude Code with Ralph Loop (max $MAX_ITERATIONS iterations)..."
+      log_info "Loop restarts Claude automatically if it dies overnight."
+
+      ITERATION=0
+      LOOP_LOG="$BUILD_DIR/ralph-loop.log"
+
+      (
+        cd "$PROJECT_DIR"
+
+        while true; do
+          ITERATION=$((ITERATION + 1))
+
+          # ── Safety valve ──
+          if [[ $ITERATION -gt $MAX_ITERATIONS ]]; then
+            echo "$(date -Iseconds) | Ralph Loop: max iterations ($MAX_ITERATIONS) reached. Stopping." >> "$LOOP_LOG"
+            echo "| $(date +%H:%M) | Ralph Loop stopped | Max iterations ($MAX_ITERATIONS) reached |" >> "$BUILD_DIR/PROGRESS.md"
+            break
+          fi
+
+          # ── Check completion signals ──
+          if [[ -f "$BUILD_DIR/MORNING-BRIEFING.md" ]]; then
+            echo "$(date -Iseconds) | Ralph Loop: MORNING-BRIEFING.md found. Build complete." >> "$LOOP_LOG"
+            break
+          fi
+
+          if [[ -f "$BUILD_DIR/.pause-requested" ]]; then
+            echo "$(date -Iseconds) | Ralph Loop: pause requested. Stopping." >> "$LOOP_LOG"
+            echo "| $(date +%H:%M) | Ralph Loop paused | User requested pause |" >> "$BUILD_DIR/PROGRESS.md"
+            break
+          fi
+
+          if [[ -f "$BUILD_DIR/.abort-requested" ]]; then
+            echo "$(date -Iseconds) | Ralph Loop: abort requested. Stopping." >> "$LOOP_LOG"
+            echo "| $(date +%H:%M) | Ralph Loop aborted | User requested abort |" >> "$BUILD_DIR/PROGRESS.md"
+            break
+          fi
+
+          # ── Launch Claude ──
+          echo "$(date -Iseconds) | Ralph Loop: iteration $ITERATION starting" >> "$LOOP_LOG"
+
+          if [[ $ITERATION -gt 1 ]]; then
+            echo "| $(date +%H:%M) | Ralph Loop restart | Iteration $ITERATION — Claude restarted after exit/crash |" >> "$BUILD_DIR/PROGRESS.md"
+            # Brief pause before restart to avoid rapid-fire loops on immediate crashes
+            sleep 5
+          fi
+
+          # Run Claude with the overnight prompt. When it exits (for any
+          # reason), the loop checks signals and restarts if needed.
+          claude --dangerously-skip-permissions < "$OVERNIGHT_PROMPT" 2>&1 | tee -a "$BUILD_DIR/session.log"
+          EXIT_CODE=$?
+
+          echo "$(date -Iseconds) | Ralph Loop: Claude exited with code $EXIT_CODE (iteration $ITERATION)" >> "$LOOP_LOG"
+
+          # Commit any uncommitted work before restarting
+          if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+            git add -A
+            git commit -m "wip: Ralph Loop checkpoint (iteration $ITERATION, exit code $EXIT_CODE)" --no-verify 2>/dev/null || true
+            echo "$(date -Iseconds) | Ralph Loop: committed WIP checkpoint" >> "$LOOP_LOG"
+          fi
+        done
+
+        echo "$(date -Iseconds) | Ralph Loop: exited after $ITERATION iterations" >> "$LOOP_LOG"
+      ) &
+
+      LOOP_PID=$!
+      echo "$LOOP_PID" > "$BUILD_DIR/claude.pid"
+      log_success "Ralph Loop started (PID: $LOOP_PID, max $MAX_ITERATIONS iterations)"
+    fi
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${BOLD}Build Running${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "  PID:        $(cat "$BUILD_DIR/claude.pid")"
+    echo "  Project:    $PROJECT_DIR"
+    echo "  Build dir:  $BUILD_DIR"
+    if [[ "$NO_LOOP" != "1" ]]; then
+      echo "  Mode:       Ralph Loop (max $MAX_ITERATIONS iterations)"
+      echo "  Loop log:   $BUILD_DIR/ralph-loop.log"
+    else
+      echo "  Mode:       Single-shot"
+    fi
+    echo ""
+    echo "Monitor:"
+    echo "  tail -f $BUILD_DIR/PROGRESS.md"
+    echo "  cat $BUILD_DIR/SKIPPED.md"
+    echo "  cat $BUILD_DIR/TYPE-ERRORS.md"
+    if [[ "$NO_LOOP" != "1" ]]; then
+      echo "  cat $BUILD_DIR/ralph-loop.log"
+    fi
+    echo ""
+    echo "Stop:"
+    echo "  touch $BUILD_DIR/.pause-requested   # graceful stop"
+    echo "  touch $BUILD_DIR/.abort-requested   # immediate stop"
+    echo "  kill $(cat "$BUILD_DIR/claude.pid")  # force kill"
+    echo ""
+  fi
+else
+  log_dim "Phase 8: Launch (skipped — --no-launch)"
+fi
+
+# ─── Final summary ───────────────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${BOLD}Build Setup Complete${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo -e "Feature:    ${BOLD}$FEATURE_NAME${NC}"
+echo "Project:    $PROJECT_DIR"
+echo "Branch:     $BRANCH"
+echo "Build dir:  $BUILD_DIR"
+echo ""
+
+[[ "$SKIP_GIT" == "1" ]]     && echo "  [skipped] Git setup"     || echo "  [done] Git setup"
+[[ "$SKIP_DOCKER" == "1" ]]  && echo "  [skipped] Docker"        || echo "  [done] Docker"
+[[ "$SKIP_DEPS" == "1" ]]    && echo "  [skipped] Dependencies"  || echo "  [done] Dependencies"
+[[ "$SKIP_MIGRATE" == "1" ]] && echo "  [skipped] Migrations"    || echo "  [done] Migrations"
+echo "  [done] CLAUDE.md"
+echo "  [done] Session artifacts"
+
+if [[ "$NO_LAUNCH" == "1" ]]; then
+  echo ""
+  echo -e "${BOLD}To launch manually:${NC}"
+  echo "  cd $PROJECT_DIR && claude --dangerously-skip-permissions < $OVERNIGHT_PROMPT"
+fi
+echo ""

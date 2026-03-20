@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@context7/mcp-server"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "YOUR_GITHUB_TOKEN"
+      }
+    },
+    "google-docs": {
+      "command": "node",
+      "args": ["PATH_TO_GOOGLE_DOCS_MCP/index.js"]
+    }
+  },
+  "_optional": {
+    "_comment": "Uncomment and move to mcpServers if you use Linear for task tracking",
+    "linear": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-linear"],
+      "env": {
+        "LINEAR_API_KEY": "YOUR_LINEAR_API_KEY"
+      }
+    }
+  }
+}

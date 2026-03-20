@@ -1,0 +1,29 @@
+# Overnight Session Configuration
+#
+# Copy this to your project root as .overnight-config
+# and customize for your project.
+
+# Package manager (auto-detected if not set)
+# PM=pnpm
+
+# Quality gate strictness: strict | normal | lenient
+GATE_STRICTNESS=normal
+
+# Max auto-fix attempts before escalating
+MAX_FIX_ATTEMPTS=2
+
+# Task tracking: Claude Code tasks are always used as the primary tracker.
+# To also mirror tasks to Linear, uncomment and set your project key:
+# LINEAR_PROJECT=
+
+# Session timeout in hours
+SESSION_TIMEOUT=8
+
+# Preferred models (Claude 4.5/4.6 family)
+# opus   = Claude Opus 4.6 (1M context) — best reasoning, code quality, and accuracy
+# sonnet = Claude Sonnet 4.6 — lighter weight, cost-sensitive batch work only
+# haiku  = Claude Haiku 4.5 — trivial tasks only
+#
+# Default: Opus for everything. Only downgrade if you have a specific reason.
+ARCHITECT_MODEL=opus
+IMPLEMENTATION_MODEL=opus

@@ -1,0 +1,28 @@
+{
+  "version": "1.0",
+  "created_at": "2026-01-29T22:00:00-05:00",
+  "feature": {
+    "name": "User Dashboard MVP",
+    "slug": "user-dashboard-mvp"
+  },
+  "project": {
+    "directory": "/Users/example/projects/my-project",
+    "repo_url": "git@github.com:example/my-project.git",
+    "branch": "feature/user-dashboard-mvp"
+  },
+  "stack": {
+    "has_backend": true,
+    "has_frontend": true,
+    "docker_profile": "fastapi-react"
+  },
+  "artifacts": {
+    "session_dir": "/Users/example/.afk/prd-sessions/2026-01-29-user-dashboard-mvp",
+    "intake": "/Users/example/.afk/prd-sessions/2026-01-29-user-dashboard-mvp/00-INTAKE.md",
+    "research": "/Users/example/.afk/prd-sessions/2026-01-29-user-dashboard-mvp/01-RESEARCH.md",
+    "prd": "/Users/example/.afk/prd-sessions/2026-01-29-user-dashboard-mvp/02-PRD.md",
+    "edd": "/Users/example/.afk/prd-sessions/2026-01-29-user-dashboard-mvp/03-EDD.md",
+    "conflict_resolution": "/Users/example/.afk/prd-sessions/2026-01-29-user-dashboard-mvp/04-CONFLICT-RESOLUTION.md",
+    "claude_md_sprint": "/Users/example/.afk/prd-sessions/2026-01-29-user-dashboard-mvp/CLAUDE-MD-SPRINT-SECTION.md"
+  },
+  "status": "ready_for_build"
+}

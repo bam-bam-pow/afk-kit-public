@@ -1,0 +1,16 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies
+COPY frontend/package*.json frontend/bun.lockb* frontend/pnpm-lock.yaml* ./
+RUN if [ -f bun.lockb ]; then npm install -g bun && bun install; \
+    elif [ -f pnpm-lock.yaml ]; then npm install -g pnpm && pnpm install; \
+    else npm install; fi
+
+# Copy application code
+COPY frontend/ .
+
+EXPOSE 5173
+
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
